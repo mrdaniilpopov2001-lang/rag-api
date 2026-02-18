@@ -1,8 +1,9 @@
 fastapi==0.110.0
 uvicorn==0.29.0
-openai==1.12.0
-langchain==0.1.16
-langchain-community==0.0.34
+openai>=1.0.0
+langchain>=0.1.0
+langchain-openai>=0.0.5
+langchain-community>=0.0.20
 chromadb==0.4.24
 pypdf==4.2.0
-tiktoken==0.6.0
+tiktoken==0.5.2

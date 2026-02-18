@@ -1,10 +1,10 @@
-# fly.toml app configuration file generated for rag-api-server on 2026-02-18T08:21:44Z
+# fly.toml app configuration file generated for rag-api-server on 2026-02-18T09:22:24Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
 app = 'rag-api-server'
-primary_region = 'nrt'
+primary_region = 'arn'
 
 [build]
 

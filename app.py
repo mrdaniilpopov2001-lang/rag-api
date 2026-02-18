@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
-from langchain.chat_models import ChatOpenAI
+from langchain_openai import ChatOpenAI
 from langchain.chains import RetrievalQA
 
 app = FastAPI()

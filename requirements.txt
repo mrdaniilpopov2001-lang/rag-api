@@ -6,3 +6,4 @@ chromadb
 pypdf
 tiktoken
 langchain-openai
+langchain-community

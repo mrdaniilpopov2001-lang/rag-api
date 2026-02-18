@@ -2,8 +2,8 @@ fastapi
 uvicorn
 openai
 langchain
+langchain-community
+langchain-openai
 chromadb
 pypdf
 tiktoken
-langchain-openai
-langchain-community

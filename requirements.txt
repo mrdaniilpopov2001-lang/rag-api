@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 openai
-langchain
+langchain==0.0.353
 langchain-community
 langchain-openai
 chromadb

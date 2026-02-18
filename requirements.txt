@@ -2,8 +2,6 @@ fastapi
 uvicorn
 openai
 langchain==0.0.353
-langchain-community
-langchain-openai
 chromadb
 pypdf
 tiktoken

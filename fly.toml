@@ -1,12 +1,16 @@
-# fly.toml app configuration file generated for rag-api-server on 2026-02-18T09:41:42Z
+# fly.toml app configuration file generated for rag-api-server on 2026-02-23T18:31:52+11:00
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
 app = 'rag-api-server'
-primary_region = 'arn'
+primary_region = 'nrt'
 
 [build]
+
+[[mounts]]
+  source = 'rag_data'
+  destination = '/data'
 
 [http_service]
   internal_port = 8080
@@ -21,6 +25,3 @@ primary_region = 'arn'
   cpu_kind = 'shared'
   cpus = 1
   memory_mb = 1024
-[mounts]
-  source = "rag_data"
-  destination = "/data"

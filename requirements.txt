@@ -7,3 +7,5 @@ langchain-community>=0.0.20
 chromadb==0.4.24
 pypdf==4.2.0
 tiktoken==0.5.2
+python-multipart==0.0.9
+pymupdf

@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import PyMuPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from langchain.retrievers import BM25Retriever, EnsembleRetriever
 
@@ -205,3 +205,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     )
 
     return {"status": "PDF uploaded and indexed successfully"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8080)

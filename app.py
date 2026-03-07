@@ -1,27 +1,24 @@
 import os
 from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
+
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
+
+from langchain.retrievers import BM25Retriever, EnsembleRetriever
+
+from langchain_core.prompts import ChatPromptTemplate
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.chains import create_retrieval_chain
 
 app = FastAPI()
-
-# ===============================
-#           ENVIRONMENT
-# ===============================
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY environment variable not set")
-
-# ===============================
-#      PERSISTENT STORAGE
-# ===============================
 
 DATA_DIR = "/data"
 FILES_DIR = os.path.join(DATA_DIR, "files")
@@ -34,38 +31,11 @@ class Question(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "THE ATLAS-DAEDALUS PROJECT running"}
+    return {"status": "ATLAS-DAEDALUS RAG API running"}
 
 
 # ===============================
-#         STRICT PROMPT
-# ===============================
-
-STRICT_PROMPT = PromptTemplate(
-    input_variables=["context", "question"],
-    template="""
-You are a senior rotating equipment engineer answering strictly from API standard text.
-
-Rules:
-- Answer ONLY using the provided context.
-- If exact value exists, state it precisely.
-- Always include:
-  - Section number
-  - Exact quotation
-- If not found in context, respond: "NOT FOUND IN PROVIDED EXCERPT."
-
-Context:
-{context}
-
-Question:
-{question}
-
-Answer:
-"""
-)
-
-# ===============================
-#            ASK
+# ASK
 # ===============================
 
 @app.post("/ask")
@@ -81,12 +51,26 @@ def ask(question: Question):
         embedding_function=embeddings
     )
 
-    retriever = db.as_retriever(
+    # VECTOR RETRIEVER
+    vector_retriever = db.as_retriever(
         search_type="mmr",
         search_kwargs={
-            "k": 25,
-            "fetch_k": 60
+            "k": 12,
+            "fetch_k": 30
         }
+    )
+
+    # Получаем документы для BM25
+    docs = db.similarity_search("engineering", k=50)
+
+    # BM25 RETRIEVER
+    bm25_retriever = BM25Retriever.from_documents(docs)
+    bm25_retriever.k = 6
+
+    # HYBRID RETRIEVER
+    retriever = EnsembleRetriever(
+        retrievers=[bm25_retriever, vector_retriever],
+        weights=[0.4, 0.6]
     )
 
     llm = ChatOpenAI(
@@ -95,32 +79,44 @@ def ask(question: Question):
         openai_api_key=OPENAI_API_KEY
     )
 
-    qa = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="map_reduce",
-        retriever=retriever,
-        chain_type_kwargs={
-            "prompt": STRICT_PROMPT
-        },
-        return_source_documents=True
+    prompt = ChatPromptTemplate.from_template(
+        """
+You are an engineering assistant working with technical standards.
+
+Use ONLY the provided context to answer the question.
+
+If the answer is not in the context, say:
+"Not found in the provided standard excerpt."
+
+Context:
+{context}
+
+Question:
+{input}
+"""
     )
 
-    result = qa.invoke({"query": question.query})
+    document_chain = create_stuff_documents_chain(
+        llm,
+        prompt
+    )
+
+    qa_chain = create_retrieval_chain(
+        retriever,
+        document_chain
+    )
+
+    result = qa_chain.invoke({
+        "input": question.query
+    })
 
     return {
-        "answer": result["result"],
-        "sources": [
-            {
-                "page": doc.metadata.get("page"),
-                "file": doc.metadata.get("source")
-            }
-            for doc in result["source_documents"]
-        ]
+        "answer": result["answer"]
     }
 
 
 # ===============================
-#           UPLOAD
+# UPLOAD
 # ===============================
 
 @app.post("/upload")
@@ -145,8 +141,8 @@ async def upload_pdf(file: UploadFile = File(...)):
         return {"error": "PDF parsing failed or document is empty"}
 
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=2000,
-        chunk_overlap=300
+        chunk_size=3000,
+        chunk_overlap=500
     )
 
     splits = text_splitter.split_documents(documents)

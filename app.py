@@ -35,6 +35,33 @@ def root():
 
 
 # ===============================
+# QUERY EXPANSION
+# ===============================
+
+def expand_query(query: str, llm):
+
+    prompt = f"""
+Rewrite the engineering question into 4 alternative search queries
+that could appear in a technical standard.
+
+Return only the queries, one per line.
+
+Question:
+{query}
+"""
+
+    response = llm.invoke(prompt)
+
+    alternatives = [
+        q.strip()
+        for q in response.content.split("\n")
+        if q.strip()
+    ]
+
+    return [query] + alternatives
+
+
+# ===============================
 # ASK
 # ===============================
 
@@ -106,13 +133,25 @@ Question:
         document_chain
     )
 
-    result = qa_chain.invoke({
-        "input": question.query
-    })
+    # === QUERY EXPANSION ===
 
-    return {
-        "answer": result["answer"]
-    }
+    queries = expand_query(question.query, llm)
+
+    answers = []
+
+    for q in queries:
+
+        result = qa_chain.invoke({
+            "input": q
+        })
+
+        if "Not found" not in result["answer"]:
+            answers.append(result["answer"])
+
+    if answers:
+        return {"answer": answers[0]}
+
+    return {"answer": "Not found in the provided standard excerpt."}
 
 
 # ===============================
@@ -141,8 +180,18 @@ async def upload_pdf(file: UploadFile = File(...)):
         return {"error": "PDF parsing failed or document is empty"}
 
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=3000,
-        chunk_overlap=500
+        chunk_size=2000,
+        chunk_overlap=300,
+        separators=[
+            "\nSECTION ",
+            "\nSection ",
+            "\nCHAPTER ",
+            "\nChapter ",
+            "\n\n",
+            "\n",
+            ". ",
+            " "
+        ]
     )
 
     splits = text_splitter.split_documents(documents)

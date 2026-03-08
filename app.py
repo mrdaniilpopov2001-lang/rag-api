@@ -8,9 +8,6 @@ from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.retrievers import BM25Retriever
 
-from langchain_core.prompts import ChatPromptTemplate
-from langchain.chains.combine_documents import create_stuff_documents_chain
-
 app = FastAPI()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -58,23 +55,36 @@ Question:
 
 
 # ===============================
-# HELPER: MERGE DOCS
+# HELPERS
 # ===============================
 
 def unique_docs(docs):
     seen = set()
-    unique = []
+    result = []
 
     for doc in docs:
-        key = (
-            doc.page_content[:300],
-            tuple(sorted(doc.metadata.items())) if doc.metadata else ()
-        )
+        metadata_items = tuple(sorted(doc.metadata.items())) if doc.metadata else ()
+        key = (doc.page_content[:500], metadata_items)
+
         if key not in seen:
             seen.add(key)
-            unique.append(doc)
+            result.append(doc)
 
-    return unique
+    return result
+
+
+def build_context(docs, max_docs=8):
+    selected = docs[:max_docs]
+    parts = []
+
+    for i, doc in enumerate(selected, start=1):
+        page = doc.metadata.get("page", "unknown")
+        source = doc.metadata.get("source", "unknown")
+        parts.append(
+            f"[Document {i} | page={page} | source={source}]\n{doc.page_content}"
+        )
+
+    return "\n\n".join(parts)
 
 
 # ===============================
@@ -102,8 +112,12 @@ def ask(question: Question):
         }
     )
 
-    # Берём набор документов для BM25
-    bm25_docs = db.similarity_search("engineering standard compressor vibration thrust", k=80)
+    # Набор документов для BM25
+    bm25_docs = db.similarity_search(
+        "engineering standard compressor vibration thrust coupling shaft test limit equation section",
+        k=80
+    )
+
     bm25_retriever = BM25Retriever.from_documents(bm25_docs)
     bm25_retriever.k = 8
 
@@ -113,30 +127,7 @@ def ask(question: Question):
         openai_api_key=OPENAI_API_KEY
     )
 
-    prompt = ChatPromptTemplate.from_template(
-        """
-You are an engineering assistant working with technical standards.
-
-Use ONLY the provided context to answer the question.
-
-If the answer is not in the context, say:
-"Not found in the provided standard excerpt."
-
-Context:
-{context}
-
-Question:
-{input}
-"""
-    )
-
-    document_chain = create_stuff_documents_chain(
-        llm,
-        prompt
-    )
-
     queries = expand_query(question.query, llm)
-
     answers = []
 
     for q in queries:
@@ -148,13 +139,28 @@ Question:
         if not merged_docs:
             continue
 
-        result = document_chain.invoke({
-            "input": q,
-            "context": merged_docs
-        })
+        context = build_context(merged_docs, max_docs=8)
 
-        if "Not found" not in result:
-            answers.append(result)
+        prompt = f"""
+You are an engineering assistant working with technical standards.
+
+Use ONLY the provided context to answer the question.
+Do not invent values, formulas, limits, or section numbers.
+If the answer is not explicitly supported by the context, say exactly:
+Not found in the provided standard excerpt.
+
+Question:
+{q}
+
+Context:
+{context}
+"""
+
+        response = llm.invoke(prompt)
+        answer_text = response.content.strip()
+
+        if answer_text != "Not found in the provided standard excerpt.":
+            answers.append(answer_text)
 
     if answers:
         return {"answer": answers[0]}

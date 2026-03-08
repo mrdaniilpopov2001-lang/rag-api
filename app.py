@@ -6,12 +6,10 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-from langchain.retrievers import BM25Retriever, EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain.chains import create_retrieval_chain
 
 app = FastAPI()
 
@@ -39,7 +37,6 @@ def root():
 # ===============================
 
 def expand_query(query: str, llm):
-
     prompt = f"""
 Rewrite the engineering question into 4 alternative search queries
 that could appear in a technical standard.
@@ -49,7 +46,6 @@ Return only the queries, one per line.
 Question:
 {query}
 """
-
     response = llm.invoke(prompt)
 
     alternatives = [
@@ -59,6 +55,26 @@ Question:
     ]
 
     return [query] + alternatives
+
+
+# ===============================
+# HELPER: MERGE DOCS
+# ===============================
+
+def unique_docs(docs):
+    seen = set()
+    unique = []
+
+    for doc in docs:
+        key = (
+            doc.page_content[:300],
+            tuple(sorted(doc.metadata.items())) if doc.metadata else ()
+        )
+        if key not in seen:
+            seen.add(key)
+            unique.append(doc)
+
+    return unique
 
 
 # ===============================
@@ -78,7 +94,6 @@ def ask(question: Question):
         embedding_function=embeddings
     )
 
-    # VECTOR RETRIEVER
     vector_retriever = db.as_retriever(
         search_type="mmr",
         search_kwargs={
@@ -87,18 +102,10 @@ def ask(question: Question):
         }
     )
 
-    # Получаем документы для BM25
-    docs = db.similarity_search("engineering", k=50)
-
-    # BM25 RETRIEVER
-    bm25_retriever = BM25Retriever.from_documents(docs)
-    bm25_retriever.k = 6
-
-    # HYBRID RETRIEVER
-    retriever = EnsembleRetriever(
-        retrievers=[bm25_retriever, vector_retriever],
-        weights=[0.4, 0.6]
-    )
+    # Берём набор документов для BM25
+    bm25_docs = db.similarity_search("engineering standard compressor vibration thrust", k=80)
+    bm25_retriever = BM25Retriever.from_documents(bm25_docs)
+    bm25_retriever.k = 8
 
     llm = ChatOpenAI(
         model="gpt-4o",
@@ -128,25 +135,26 @@ Question:
         prompt
     )
 
-    qa_chain = create_retrieval_chain(
-        retriever,
-        document_chain
-    )
-
-    # === QUERY EXPANSION ===
-
     queries = expand_query(question.query, llm)
 
     answers = []
 
     for q in queries:
+        vector_docs = vector_retriever.invoke(q)
+        keyword_docs = bm25_retriever.invoke(q)
 
-        result = qa_chain.invoke({
-            "input": q
+        merged_docs = unique_docs(vector_docs + keyword_docs)
+
+        if not merged_docs:
+            continue
+
+        result = document_chain.invoke({
+            "input": q,
+            "context": merged_docs
         })
 
-        if "Not found" not in result["answer"]:
-            answers.append(result["answer"])
+        if "Not found" not in result:
+            answers.append(result)
 
     if answers:
         return {"answer": answers[0]}
@@ -205,6 +213,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     )
 
     return {"status": "PDF uploaded and indexed successfully"}
+
 
 if __name__ == "__main__":
     import uvicorn

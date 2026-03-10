@@ -34,7 +34,7 @@ def root():
 
 
 # ===============================
-# HELPERS
+# TEXT HELPERS
 # ===============================
 
 def normalize_text(text: str) -> str:
@@ -61,6 +61,116 @@ def save_pages_corpus(corpus: List[Dict[str, Any]]) -> None:
     with open(PAGES_JSON, "w", encoding="utf-8") as f:
         json.dump(corpus, f, ensure_ascii=False, indent=2)
 
+
+# ===============================
+# FORMULA HELPERS
+# ===============================
+
+def clean_latex_escapes(text: str) -> str:
+    text = text.replace("\\\\[", "\\[")
+    text = text.replace("\\\\]", "\\]")
+    text = text.replace("\\\\(", "\\(")
+    text = text.replace("\\\\)", "\\)")
+    text = text.replace("\\\\frac", "\\frac")
+    text = text.replace("\\\\times", "\\times")
+    text = text.replace("\\\\cdot", "\\cdot")
+    text = text.replace("\\\\mu", "\\mu")
+    text = text.replace("\\\\alpha", "\\alpha")
+    text = text.replace("\\\\beta", "\\beta")
+    text = text.replace("\\\\gamma", "\\gamma")
+    return text
+
+
+def normalize_variable_names(text: str) -> str:
+    replacements = {
+        "Nmc": "N_mc",
+        "Nmr": "N_mr",
+        "Avl": "Avl",
+        "Av1": "Av1",
+        "Avi": "Avi",
+    }
+    for old, new in replacements.items():
+        text = re.sub(rf"\b{re.escape(old)}\b", new, text)
+    return text
+
+
+def latex_to_pretty_text(latex: str) -> str:
+    text = latex
+
+    text = text.replace("\\[", "").replace("\\]", "")
+    text = text.replace("\\(", "").replace("\\)", "")
+
+    text = normalize_variable_names(text)
+
+    frac_pattern = re.compile(r"\\frac\{([^{}]+)\}\{([^{}]+)\}")
+    while frac_pattern.search(text):
+        text = frac_pattern.sub(r"(\1 / \2)", text)
+
+    replacements = {
+        "\\times": "×",
+        "\\cdot": "·",
+        "\\mu": "μ",
+        "\\alpha": "α",
+        "\\beta": "β",
+        "\\gamma": "γ",
+        "\\Delta": "Δ",
+        "\\delta": "δ",
+        "\\leq": "≤",
+        "\\geq": "≥",
+        "\\neq": "≠",
+        "\\approx": "≈",
+    }
+
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    text = re.sub(r"_\{([^{}]+)\}", r"_\1", text)
+    text = re.sub(r"\^\{([^{}]+)\}", r"^\1", text)
+
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def extract_formulas(text: str) -> List[Dict[str, str]]:
+    text = clean_latex_escapes(text)
+    formulas = []
+
+    block_patterns = [
+        r"\\\[(.*?)\\\]",
+        r"\\\((.*?)\\\)"
+    ]
+
+    for pattern in block_patterns:
+        matches = re.findall(pattern, text, flags=re.DOTALL)
+        for match in matches:
+            latex_formula = match.strip()
+            pretty_formula = latex_to_pretty_text(latex_formula)
+            formulas.append({
+                "latex": latex_formula,
+                "pretty": pretty_formula
+            })
+
+    return formulas
+
+
+def replace_formula_blocks_with_pretty(text: str) -> str:
+    text = clean_latex_escapes(text)
+
+    def repl_block(match):
+        latex_formula = match.group(1).strip()
+        return latex_to_pretty_text(latex_formula)
+
+    text = re.sub(r"\\\[(.*?)\\\]", repl_block, text, flags=re.DOTALL)
+    text = re.sub(r"\\\((.*?)\\\)", repl_block, text, flags=re.DOTALL)
+    text = normalize_variable_names(text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+
+
+# ===============================
+# RETRIEVAL HELPERS
+# ===============================
 
 def doc_key(hit: Dict[str, Any]) -> Tuple[str, Any, str]:
     return (
@@ -95,11 +205,7 @@ def build_context(hits: List[Dict[str, Any]], max_docs: int = 10) -> str:
     return "\n\n".join(parts)
 
 
-# ===============================
-# RETRIEVAL
-# ===============================
-
-def bm25_search(query: str, corpus: List[Dict[str, Any]], k: int = 12) -> List[Dict[str, Any]]:
+def bm25_search(query: str, corpus: List[Dict[str, Any]], k: int = 10) -> List[Dict[str, Any]]:
     if not corpus:
         return []
 
@@ -123,7 +229,7 @@ def bm25_search(query: str, corpus: List[Dict[str, Any]], k: int = 12) -> List[D
     return results
 
 
-def vector_search(db: Chroma, query: str, k: int = 12, fetch_k: int = 50) -> List[Dict[str, Any]]:
+def vector_search(db: Chroma, query: str, k: int = 10, fetch_k: int = 40) -> List[Dict[str, Any]]:
     docs = db.max_marginal_relevance_search(
         query,
         k=k,
@@ -223,7 +329,7 @@ def build_query_set(query: str, llm: ChatOpenAI) -> List[str]:
 
 
 # ===============================
-# ANSWER GENERATION
+# ANSWER EXTRACTION
 # ===============================
 
 def answer_from_context(question: str, hits: List[Dict[str, Any]], llm: ChatOpenAI) -> str:
@@ -239,6 +345,7 @@ If the answer is explicitly present in the context:
 - answer clearly
 - include the exact value or formula if available
 - include the page number if it is visible in the context
+- if there is a formula, you may present it in LaTeX form
 
 If the answer is NOT explicitly supported by the context, say exactly:
 Not found in the provided standard excerpt.
@@ -307,12 +414,12 @@ def ask(question: Question):
 
     for q in query_set:
         try:
-            vector_result_lists.append(vector_search(db, q, k=12, fetch_k=50))
+            vector_result_lists.append(vector_search(db, q, k=10, fetch_k=40))
         except Exception:
             pass
 
         try:
-            bm25_result_lists.append(bm25_search(q, corpus, k=12))
+            bm25_result_lists.append(bm25_search(q, corpus, k=10))
         except Exception:
             pass
 
@@ -322,41 +429,48 @@ def ask(question: Question):
     if not fused_hits:
         return {
             "answer": "No documents retrieved from database.",
+            "answer_latex": "No documents retrieved from database.",
+            "formulas": [],
             "sources": [],
             "retrieved_chunks_preview": [],
             "queries_used": query_set
         }
 
-    answer_text = answer_from_context(question.query, fused_hits, llm)
+    answer_text_raw = answer_from_context(question.query, fused_hits, llm)
 
-    # Second pass if the first pass did not find the answer
-    if answer_text == "Not found in the provided standard excerpt.":
+    if answer_text_raw == "Not found in the provided standard excerpt.":
         extra_queries = second_pass_queries(question.query, llm)
         extra_lists: List[List[Dict[str, Any]]] = []
 
         for q in extra_queries:
             try:
-                extra_lists.append(vector_search(db, q, k=12, fetch_k=50))
+                extra_lists.append(vector_search(db, q, k=10, fetch_k=40))
             except Exception:
                 pass
 
             try:
-                extra_lists.append(bm25_search(q, corpus, k=12))
+                extra_lists.append(bm25_search(q, corpus, k=10))
             except Exception:
                 pass
 
         if extra_lists:
             second_pass_hits = rrf_fuse([fused_hits] + extra_lists)
             second_pass_hits = unique_hits(second_pass_hits)
-            second_answer = answer_from_context(question.query, second_pass_hits, llm)
+            second_answer_raw = answer_from_context(question.query, second_pass_hits, llm)
 
-            if second_answer != "Not found in the provided standard excerpt.":
+            if second_answer_raw != "Not found in the provided standard excerpt.":
                 fused_hits = second_pass_hits
-                answer_text = second_answer
+                answer_text_raw = second_answer_raw
                 query_set = list(dict.fromkeys(query_set + extra_queries))
 
+    answer_latex = clean_latex_escapes(answer_text_raw)
+    answer_pretty = replace_formula_blocks_with_pretty(answer_latex)
+    formulas = extract_formulas(answer_latex)
+
     return {
-        "answer": answer_text,
+        "answer": answer_pretty,
+        "answer_latex": answer_latex,
+        "formulas": formulas,
         "sources": [
             {
                 "page": hit["page"],

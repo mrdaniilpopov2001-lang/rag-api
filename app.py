@@ -85,26 +85,37 @@ def normalize_variable_names(text: str) -> str:
     replacements = {
         "Nmc": "N_mc",
         "Nmr": "N_mr",
-        "Avl": "Avl",
-        "Av1": "Av1",
-        "Avi": "Avi",
+        "Avl": "A_vl",
+        "Av1": "A_v1",
+        "Avi": "A_vi",
     }
+
     for old, new in replacements.items():
         text = re.sub(rf"\b{re.escape(old)}\b", new, text)
+
     return text
+
+
+def replace_frac_once(text: str) -> str:
+    pattern = re.compile(r"\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}")
+    return pattern.sub(r"(\1 / \2)", text)
 
 
 def latex_to_pretty_text(latex: str) -> str:
     text = latex
 
+    # убираем обрамление
     text = text.replace("\\[", "").replace("\\]", "")
     text = text.replace("\\(", "").replace("\\)", "")
 
     text = normalize_variable_names(text)
 
-    frac_pattern = re.compile(r"\\frac\{([^{}]+)\}\{([^{}]+)\}")
-    while frac_pattern.search(text):
-        text = frac_pattern.sub(r"(\1 / \2)", text)
+    # раскрываем вложенные \frac несколько раз
+    for _ in range(10):
+        new_text = replace_frac_once(text)
+        if new_text == text:
+            break
+        text = new_text
 
     replacements = {
         "\\times": "×",
@@ -124,10 +135,14 @@ def latex_to_pretty_text(latex: str) -> str:
     for old, new in replacements.items():
         text = text.replace(old, new)
 
+    # индексы/степени
     text = re.sub(r"_\{([^{}]+)\}", r"_\1", text)
     text = re.sub(r"\^\{([^{}]+)\}", r"^\1", text)
 
+    # убрать лишние slash-пробелы
+    text = text.replace("\\", "")
     text = re.sub(r"\s+", " ", text).strip()
+
     return text
 
 
@@ -140,11 +155,19 @@ def extract_formulas(text: str) -> List[Dict[str, str]]:
         r"\\\((.*?)\\\)"
     ]
 
+    seen = set()
+
     for pattern in block_patterns:
         matches = re.findall(pattern, text, flags=re.DOTALL)
         for match in matches:
             latex_formula = match.strip()
             pretty_formula = latex_to_pretty_text(latex_formula)
+
+            key = (latex_formula, pretty_formula)
+            if key in seen:
+                continue
+            seen.add(key)
+
             formulas.append({
                 "latex": latex_formula,
                 "pretty": pretty_formula
@@ -162,11 +185,12 @@ def replace_formula_blocks_with_pretty(text: str) -> str:
 
     text = re.sub(r"\\\[(.*?)\\\]", repl_block, text, flags=re.DOTALL)
     text = re.sub(r"\\\((.*?)\\\)", repl_block, text, flags=re.DOTALL)
+
     text = normalize_variable_names(text)
+    text = text.replace("\\", "")
     text = re.sub(r"\s+", " ", text).strip()
 
     return text
-
 
 # ===============================
 # RETRIEVAL HELPERS

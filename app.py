@@ -39,6 +39,8 @@ def root():
 
 def normalize_text(text: str) -> str:
     text = text.replace("\x00", " ")
+    text = text.replace("\u200b", " ")
+    text = text.replace("\ufeff", " ")
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -78,6 +80,12 @@ def clean_latex_escapes(text: str) -> str:
     text = text.replace("\\\\alpha", "\\alpha")
     text = text.replace("\\\\beta", "\\beta")
     text = text.replace("\\\\gamma", "\\gamma")
+    text = text.replace("\\\\Delta", "\\Delta")
+    text = text.replace("\\\\delta", "\\delta")
+    text = text.replace("\\\\min", "\\min")
+    text = text.replace("\\\\max", "\\max")
+    text = text.replace("\\\\left", "\\left")
+    text = text.replace("\\\\right", "\\right")
     return text
 
 
@@ -88,6 +96,8 @@ def normalize_variable_names(text: str) -> str:
         "Avl": "A_vl",
         "Av1": "A_v1",
         "Avi": "A_vi",
+        "Nc": "N_c",
+        "Nr": "N_r",
     }
 
     for old, new in replacements.items():
@@ -102,15 +112,13 @@ def replace_frac_once(text: str) -> str:
 
 
 def latex_to_pretty_text(latex: str) -> str:
-    text = latex
+    text = clean_latex_escapes(latex)
 
-    # убираем обрамление
     text = text.replace("\\[", "").replace("\\]", "")
     text = text.replace("\\(", "").replace("\\)", "")
 
     text = normalize_variable_names(text)
 
-    # раскрываем вложенные \frac несколько раз
     for _ in range(10):
         new_text = replace_frac_once(text)
         if new_text == text:
@@ -130,67 +138,34 @@ def latex_to_pretty_text(latex: str) -> str:
         "\\geq": "≥",
         "\\neq": "≠",
         "\\approx": "≈",
+        "\\min": "min",
+        "\\max": "max",
+        "\\left": "",
+        "\\right": "",
     }
 
     for old, new in replacements.items():
         text = text.replace(old, new)
 
-    # индексы/степени
     text = re.sub(r"_\{([^{}]+)\}", r"_\1", text)
     text = re.sub(r"\^\{([^{}]+)\}", r"^\1", text)
-
-    # убрать лишние slash-пробелы
+    text = text.replace("{", "").replace("}", "")
     text = text.replace("\\", "")
     text = re.sub(r"\s+", " ", text).strip()
 
     return text
 
 
-def extract_formulas(text: str) -> List[Dict[str, str]]:
-    text = clean_latex_escapes(text)
-    formulas = []
+def extract_json_block(text: str) -> Dict[str, Any]:
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return {}
 
-    block_patterns = [
-        r"\\\[(.*?)\\\]",
-        r"\\\((.*?)\\\)"
-    ]
+    try:
+        return json.loads(match.group(0))
+    except Exception:
+        return {}
 
-    seen = set()
-
-    for pattern in block_patterns:
-        matches = re.findall(pattern, text, flags=re.DOTALL)
-        for match in matches:
-            latex_formula = match.strip()
-            pretty_formula = latex_to_pretty_text(latex_formula)
-
-            key = (latex_formula, pretty_formula)
-            if key in seen:
-                continue
-            seen.add(key)
-
-            formulas.append({
-                "latex": latex_formula,
-                "pretty": pretty_formula
-            })
-
-    return formulas
-
-
-def replace_formula_blocks_with_pretty(text: str) -> str:
-    text = clean_latex_escapes(text)
-
-    def repl_block(match):
-        latex_formula = match.group(1).strip()
-        return latex_to_pretty_text(latex_formula)
-
-    text = re.sub(r"\\\[(.*?)\\\]", repl_block, text, flags=re.DOTALL)
-    text = re.sub(r"\\\((.*?)\\\)", repl_block, text, flags=re.DOTALL)
-
-    text = normalize_variable_names(text)
-    text = text.replace("\\", "")
-    text = re.sub(r"\s+", " ", text).strip()
-
-    return text
 
 # ===============================
 # RETRIEVAL HELPERS
@@ -356,23 +331,46 @@ def build_query_set(query: str, llm: ChatOpenAI) -> List[str]:
 # ANSWER EXTRACTION
 # ===============================
 
-def answer_from_context(question: str, hits: List[Dict[str, Any]], llm: ChatOpenAI) -> str:
+def answer_from_context(question: str, hits: List[Dict[str, Any]], llm: ChatOpenAI) -> Dict[str, Any]:
     context = build_context(hits, max_docs=10)
 
     prompt = f"""
 You are an engineering assistant working with technical standards.
 
-Use ONLY the provided context to answer the question.
-Do not invent formulas, values, limits, section numbers, or requirements.
+Use ONLY the provided context.
+Do not invent formulas, values, units, limits, or section numbers.
 
-If the answer is explicitly present in the context:
-- answer clearly
-- include the exact value or formula if available
-- include the page number if it is visible in the context
-- if there is a formula, you may present it in LaTeX form
+Return ONLY valid JSON.
 
-If the answer is NOT explicitly supported by the context, say exactly:
-Not found in the provided standard excerpt.
+If the answer is explicitly present in the context, return exactly this schema:
+
+{{
+  "answer": "short engineering answer in plain English",
+  "formula_plain": "formula in readable plain text, for example: A_vl = min((25.4 * 12000 / N_mc), 25.4)",
+  "formula_latex": "formula in proper LaTeX if available, otherwise empty string",
+  "variables": [
+    {{
+      "symbol": "N_mc",
+      "meaning": "maximum continuous speed",
+      "units": "rpm"
+    }}
+  ],
+  "found": true
+}}
+
+Rules:
+- formula_plain must be readable plain text, not LaTeX
+- formula_plain must use operators like *, /, min(), max()
+- if there is no formula, set formula_plain and formula_latex to empty strings
+- if the answer is not explicitly supported by the context, return exactly:
+
+{{
+  "answer": "Not found in the provided standard excerpt.",
+  "formula_plain": "",
+  "formula_latex": "",
+  "variables": [],
+  "found": false
+}}
 
 Question:
 {question}
@@ -380,8 +378,28 @@ Question:
 Context:
 {context}
 """
-    response = llm.invoke(prompt)
-    return response.content.strip()
+    try:
+        response = llm.invoke(prompt)
+        parsed = extract_json_block(response.content)
+
+        if not parsed:
+            return {
+                "answer": "Not found in the provided standard excerpt.",
+                "formula_plain": "",
+                "formula_latex": "",
+                "variables": [],
+                "found": False
+            }
+
+        return parsed
+    except Exception:
+        return {
+            "answer": "Not found in the provided standard excerpt.",
+            "formula_plain": "",
+            "formula_latex": "",
+            "variables": [],
+            "found": False
+        }
 
 
 def second_pass_queries(question: str, llm: ChatOpenAI) -> List[str]:
@@ -440,12 +458,12 @@ def ask(question: Question):
         try:
             vector_result_lists.append(vector_search(db, q, k=10, fetch_k=40))
         except Exception:
-            pass
+            continue
 
         try:
             bm25_result_lists.append(bm25_search(q, corpus, k=10))
         except Exception:
-            pass
+            continue
 
     fused_hits = rrf_fuse(vector_result_lists + bm25_result_lists)
     fused_hits = unique_hits(fused_hits)
@@ -453,16 +471,18 @@ def ask(question: Question):
     if not fused_hits:
         return {
             "answer": "No documents retrieved from database.",
-            "answer_latex": "No documents retrieved from database.",
-            "formulas": [],
+            "formula_plain": "",
+            "formula_latex": "",
+            "formula_pretty_from_latex": "",
+            "variables": [],
             "sources": [],
             "retrieved_chunks_preview": [],
             "queries_used": query_set
         }
 
-    answer_text_raw = answer_from_context(question.query, fused_hits, llm)
+    answer_obj = answer_from_context(question.query, fused_hits, llm)
 
-    if answer_text_raw == "Not found in the provided standard excerpt.":
+    if not answer_obj.get("found", False):
         extra_queries = second_pass_queries(question.query, llm)
         extra_lists: List[List[Dict[str, Any]]] = []
 
@@ -480,21 +500,22 @@ def ask(question: Question):
         if extra_lists:
             second_pass_hits = rrf_fuse([fused_hits] + extra_lists)
             second_pass_hits = unique_hits(second_pass_hits)
-            second_answer_raw = answer_from_context(question.query, second_pass_hits, llm)
+            second_answer_obj = answer_from_context(question.query, second_pass_hits, llm)
 
-            if second_answer_raw != "Not found in the provided standard excerpt.":
+            if second_answer_obj.get("found", False):
                 fused_hits = second_pass_hits
-                answer_text_raw = second_answer_raw
+                answer_obj = second_answer_obj
                 query_set = list(dict.fromkeys(query_set + extra_queries))
 
-    answer_latex = clean_latex_escapes(answer_text_raw)
-    answer_pretty = replace_formula_blocks_with_pretty(answer_latex)
-    formulas = extract_formulas(answer_latex)
+    formula_latex = clean_latex_escapes(answer_obj.get("formula_latex", ""))
+    formula_pretty = latex_to_pretty_text(formula_latex) if formula_latex else ""
 
     return {
-        "answer": answer_pretty,
-        "answer_latex": answer_latex,
-        "formulas": formulas,
+        "answer": answer_obj.get("answer", "Not found in the provided standard excerpt."),
+        "formula_plain": answer_obj.get("formula_plain", ""),
+        "formula_latex": formula_latex,
+        "formula_pretty_from_latex": formula_pretty,
+        "variables": answer_obj.get("variables", []),
         "sources": [
             {
                 "page": hit["page"],

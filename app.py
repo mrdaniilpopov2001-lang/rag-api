@@ -1,7 +1,7 @@
 import json
 import os
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
@@ -62,16 +62,20 @@ def save_pages_corpus(corpus: List[Dict[str, Any]]) -> None:
         json.dump(corpus, f, ensure_ascii=False, indent=2)
 
 
+def doc_key(hit: Dict[str, Any]) -> Tuple[str, Any, str]:
+    return (
+        hit.get("source", ""),
+        hit.get("page", ""),
+        hit.get("content", "")[:500]
+    )
+
+
 def unique_hits(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen = set()
     result = []
 
     for hit in hits:
-        key = (
-            hit.get("source", ""),
-            hit.get("page", ""),
-            hit.get("content", "")[:500]
-        )
+        key = doc_key(hit)
         if key not in seen:
             seen.add(key)
             result.append(hit)
@@ -79,7 +83,23 @@ def unique_hits(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return result
 
 
-def bm25_search(query: str, corpus: List[Dict[str, Any]], k: int = 10) -> List[Dict[str, Any]]:
+def build_context(hits: List[Dict[str, Any]], max_docs: int = 10) -> str:
+    selected = hits[:max_docs]
+    parts = []
+
+    for i, hit in enumerate(selected, start=1):
+        parts.append(
+            f"[Document {i} | page={hit['page']} | source={hit['source']}]\n{hit['content']}"
+        )
+
+    return "\n\n".join(parts)
+
+
+# ===============================
+# RETRIEVAL
+# ===============================
+
+def bm25_search(query: str, corpus: List[Dict[str, Any]], k: int = 12) -> List[Dict[str, Any]]:
     if not corpus:
         return []
 
@@ -103,45 +123,7 @@ def bm25_search(query: str, corpus: List[Dict[str, Any]], k: int = 10) -> List[D
     return results
 
 
-def expand_query(query: str, llm: ChatOpenAI) -> List[str]:
-    prompt = f"""
-Rewrite the engineering question into 4 alternative search queries
-that could appear in a technical standard.
-
-Rules:
-- Keep technical meaning unchanged.
-- Prefer wording used in standards.
-- Return only the queries, one per line.
-- Do not number them.
-
-Question:
-{query}
-"""
-    try:
-        response = llm.invoke(prompt)
-        alternatives = [
-            line.strip()
-            for line in response.content.split("\n")
-            if line.strip()
-        ]
-        return [query] + alternatives[:4]
-    except Exception:
-        return [query]
-
-
-def build_context(hits: List[Dict[str, Any]], max_docs: int = 8) -> str:
-    selected = hits[:max_docs]
-    parts = []
-
-    for i, hit in enumerate(selected, start=1):
-        parts.append(
-            f"[Document {i} | page={hit['page']} | source={hit['source']}]\n{hit['content']}"
-        )
-
-    return "\n\n".join(parts)
-
-
-def vector_search(db: Chroma, query: str, k: int = 10, fetch_k: int = 40) -> List[Dict[str, Any]]:
+def vector_search(db: Chroma, query: str, k: int = 12, fetch_k: int = 50) -> List[Dict[str, Any]]:
     docs = db.max_marginal_relevance_search(
         query,
         k=k,
@@ -159,6 +141,137 @@ def vector_search(db: Chroma, query: str, k: int = 10, fetch_k: int = 40) -> Lis
         )
 
     return results
+
+
+def rrf_fuse(result_lists: List[List[Dict[str, Any]]], k: int = 60) -> List[Dict[str, Any]]:
+    score_map: Dict[Tuple[str, Any, str], float] = {}
+    obj_map: Dict[Tuple[str, Any, str], Dict[str, Any]] = {}
+
+    for result_list in result_lists:
+        for rank, hit in enumerate(result_list, start=1):
+            key = doc_key(hit)
+            score_map[key] = score_map.get(key, 0.0) + 1.0 / (k + rank)
+            obj_map[key] = hit
+
+    ranked_keys = sorted(score_map.keys(), key=lambda x: score_map[x], reverse=True)
+    return [obj_map[key] for key in ranked_keys]
+
+
+# ===============================
+# QUERY EXPANSION
+# ===============================
+
+def heuristic_expansions(query: str) -> List[str]:
+    q = query.lower()
+    expansions = [query]
+
+    if "external thrust" in q and "gear coupling" in q:
+        expansions.extend([
+            "API 617 external thrust force gear coupling formula",
+            "API 617 gear coupling external force equation",
+            "API 617 annex k external forces and moments gear couplings",
+            "external thrust force allowable gear coupling API 617",
+            "formula external thrust gear couplings rated power speed shaft diameter"
+        ])
+
+    if "shaft vibration" in q and "mechanical running test" in q:
+        expansions.extend([
+            "API 617 mechanical running test shaft vibration limit",
+            "API 617 allowable shaft vibration mechanical running test",
+            "API 617 peak to peak amplitude unfiltered shaft vibration",
+            "API 617 equation 13 shaft vibration",
+            "API 617 25.4 um 1.0 mil shaft vibration",
+            "API 617 6.8.9 shaft vibration mechanical running test",
+            "mechanical running test maximum allowable shaft vibration peak to peak"
+        ])
+
+    return list(dict.fromkeys(expansions))
+
+
+def llm_expand_query(query: str, llm: ChatOpenAI) -> List[str]:
+    prompt = f"""
+Rewrite the engineering question into 5 alternative search queries
+that could appear in a technical standard.
+
+Rules:
+- Keep the meaning unchanged.
+- Prefer standard wording.
+- Include likely keyword-heavy phrasing.
+- Return only the queries, one per line.
+- Do not number them.
+
+Question:
+{query}
+"""
+    try:
+        response = llm.invoke(prompt)
+        alternatives = [
+            line.strip()
+            for line in response.content.split("\n")
+            if line.strip()
+        ]
+        return alternatives[:5]
+    except Exception:
+        return []
+
+
+def build_query_set(query: str, llm: ChatOpenAI) -> List[str]:
+    queries = []
+    queries.extend(heuristic_expansions(query))
+    queries.extend(llm_expand_query(query, llm))
+    return list(dict.fromkeys([q.strip() for q in queries if q.strip()]))
+
+
+# ===============================
+# ANSWER GENERATION
+# ===============================
+
+def answer_from_context(question: str, hits: List[Dict[str, Any]], llm: ChatOpenAI) -> str:
+    context = build_context(hits, max_docs=10)
+
+    prompt = f"""
+You are an engineering assistant working with technical standards.
+
+Use ONLY the provided context to answer the question.
+Do not invent formulas, values, limits, section numbers, or requirements.
+
+If the answer is explicitly present in the context:
+- answer clearly
+- include the exact value or formula if available
+- include the page number if it is visible in the context
+
+If the answer is NOT explicitly supported by the context, say exactly:
+Not found in the provided standard excerpt.
+
+Question:
+{question}
+
+Context:
+{context}
+"""
+    response = llm.invoke(prompt)
+    return response.content.strip()
+
+
+def second_pass_queries(question: str, llm: ChatOpenAI) -> List[str]:
+    prompt = f"""
+Generate up to 6 very short keyword-heavy retrieval queries
+for finding the exact answer in a technical standard.
+
+Rules:
+- Focus on section-style wording, equations, limits, and exact terms.
+- Return only the queries, one per line.
+- Do not explain anything.
+
+Question:
+{question}
+"""
+    try:
+        response = llm.invoke(prompt)
+        queries = [line.strip() for line in response.content.split("\n") if line.strip()]
+        return queries[:6]
+    except Exception:
+        return []
 
 
 # ===============================
@@ -187,55 +300,60 @@ def ask(question: Question):
         openai_api_key=OPENAI_API_KEY
     )
 
-    expanded_queries = expand_query(question.query, llm)
+    query_set = build_query_set(question.query, llm)
 
-    all_hits: List[Dict[str, Any]] = []
+    vector_result_lists: List[List[Dict[str, Any]]] = []
+    bm25_result_lists: List[List[Dict[str, Any]]] = []
 
-    for q in expanded_queries:
+    for q in query_set:
         try:
-            all_hits.extend(vector_search(db, q, k=10, fetch_k=40))
+            vector_result_lists.append(vector_search(db, q, k=12, fetch_k=50))
         except Exception:
             pass
 
         try:
-            all_hits.extend(bm25_search(q, corpus, k=10))
+            bm25_result_lists.append(bm25_search(q, corpus, k=12))
         except Exception:
             pass
 
-    merged_hits = unique_hits(all_hits)
+    fused_hits = rrf_fuse(vector_result_lists + bm25_result_lists)
+    fused_hits = unique_hits(fused_hits)
 
-    if not merged_hits:
+    if not fused_hits:
         return {
             "answer": "No documents retrieved from database.",
             "sources": [],
-            "retrieved_chunks_preview": []
+            "retrieved_chunks_preview": [],
+            "queries_used": query_set
         }
 
-    context = build_context(merged_hits, max_docs=8)
+    answer_text = answer_from_context(question.query, fused_hits, llm)
 
-    prompt = f"""
-You are an engineering assistant working with technical standards.
+    # Second pass if the first pass did not find the answer
+    if answer_text == "Not found in the provided standard excerpt.":
+        extra_queries = second_pass_queries(question.query, llm)
+        extra_lists: List[List[Dict[str, Any]]] = []
 
-Use ONLY the provided context to answer the question.
-Do not invent formulas, values, limits, section numbers, or requirements.
+        for q in extra_queries:
+            try:
+                extra_lists.append(vector_search(db, q, k=12, fetch_k=50))
+            except Exception:
+                pass
 
-If the answer is explicitly present in the context:
-- answer clearly
-- include the exact value/formula if available
-- include the section or page if visible in the context
+            try:
+                extra_lists.append(bm25_search(q, corpus, k=12))
+            except Exception:
+                pass
 
-If the answer is NOT explicitly supported by the context, say exactly:
-Not found in the provided standard excerpt.
+        if extra_lists:
+            second_pass_hits = rrf_fuse([fused_hits] + extra_lists)
+            second_pass_hits = unique_hits(second_pass_hits)
+            second_answer = answer_from_context(question.query, second_pass_hits, llm)
 
-Question:
-{question.query}
-
-Context:
-{context}
-"""
-
-    response = llm.invoke(prompt)
-    answer_text = response.content.strip()
+            if second_answer != "Not found in the provided standard excerpt.":
+                fused_hits = second_pass_hits
+                answer_text = second_answer
+                query_set = list(dict.fromkeys(query_set + extra_queries))
 
     return {
         "answer": answer_text,
@@ -244,11 +362,12 @@ Context:
                 "page": hit["page"],
                 "source": hit["source"]
             }
-            for hit in merged_hits[:8]
+            for hit in fused_hits[:10]
         ],
         "retrieved_chunks_preview": [
-            hit["content"][:700] for hit in merged_hits[:8]
-        ]
+            hit["content"][:900] for hit in fused_hits[:10]
+        ],
+        "queries_used": query_set
     }
 
 

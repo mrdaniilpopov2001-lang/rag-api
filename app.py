@@ -10,7 +10,6 @@ from rank_bm25 import BM25Okapi
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import PyMuPDFLoader
-from langchain_core.documents import Document
 
 app = FastAPI()
 
@@ -34,6 +33,10 @@ def root():
     return {"status": "ATLAS-DAEDALUS RAG API running"}
 
 
+# ===============================
+# HELPERS
+# ===============================
+
 def normalize_text(text: str) -> str:
     text = text.replace("\x00", " ")
     text = re.sub(r"\s+", " ", text).strip()
@@ -43,25 +46,7 @@ def normalize_text(text: str) -> str:
 def tokenize_for_bm25(text: str) -> List[str]:
     text = text.lower()
     text = re.sub(r"[^a-z0-9\.\-\+\(\)/ ]", " ", text)
-    tokens = text.split()
-    return tokens
-
-
-def unique_docs(docs: List[Document]) -> List[Document]:
-    seen = set()
-    result = []
-
-    for doc in docs:
-        key = (
-            doc.metadata.get("source", ""),
-            doc.metadata.get("page", ""),
-            doc.page_content[:500]
-        )
-        if key not in seen:
-            seen.add(key)
-            result.append(doc)
-
-    return result
+    return text.split()
 
 
 def load_pages_corpus() -> List[Dict[str, Any]]:
@@ -72,11 +57,33 @@ def load_pages_corpus() -> List[Dict[str, Any]]:
         return json.load(f)
 
 
-def bm25_search(query: str, corpus: List[Dict[str, Any]], k: int = 6) -> List[Document]:
+def save_pages_corpus(corpus: List[Dict[str, Any]]) -> None:
+    with open(PAGES_JSON, "w", encoding="utf-8") as f:
+        json.dump(corpus, f, ensure_ascii=False, indent=2)
+
+
+def unique_hits(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    result = []
+
+    for hit in hits:
+        key = (
+            hit.get("source", ""),
+            hit.get("page", ""),
+            hit.get("content", "")[:500]
+        )
+        if key not in seen:
+            seen.add(key)
+            result.append(hit)
+
+    return result
+
+
+def bm25_search(query: str, corpus: List[Dict[str, Any]], k: int = 10) -> List[Dict[str, Any]]:
     if not corpus:
         return []
 
-    tokenized_corpus = [tokenize_for_bm25(item["page_content"]) for item in corpus]
+    tokenized_corpus = [tokenize_for_bm25(item["content"]) for item in corpus]
     bm25 = BM25Okapi(tokenized_corpus)
 
     query_tokens = tokenize_for_bm25(query)
@@ -91,12 +98,7 @@ def bm25_search(query: str, corpus: List[Dict[str, Any]], k: int = 6) -> List[Do
     results = []
     for idx in ranked_indices:
         item = corpus[idx]
-        results.append(
-            Document(
-                page_content=item["page_content"],
-                metadata=item["metadata"]
-            )
-        )
+        results.append(item)
 
     return results
 
@@ -127,24 +129,50 @@ Question:
         return [query]
 
 
-def build_context(docs: List[Document], max_docs: int = 8) -> str:
-    selected = docs[:max_docs]
+def build_context(hits: List[Dict[str, Any]], max_docs: int = 8) -> str:
+    selected = hits[:max_docs]
     parts = []
 
-    for i, doc in enumerate(selected, start=1):
-        page = doc.metadata.get("page", "unknown")
-        source = doc.metadata.get("source", "unknown")
+    for i, hit in enumerate(selected, start=1):
         parts.append(
-            f"[Document {i} | page={page} | source={source}]\n{doc.page_content}"
+            f"[Document {i} | page={hit['page']} | source={hit['source']}]\n{hit['content']}"
         )
 
     return "\n\n".join(parts)
 
 
+def vector_search(db: Chroma, query: str, k: int = 10, fetch_k: int = 40) -> List[Dict[str, Any]]:
+    docs = db.max_marginal_relevance_search(
+        query,
+        k=k,
+        fetch_k=fetch_k
+    )
+
+    results = []
+    for doc in docs:
+        results.append(
+            {
+                "page": doc.metadata.get("page", "unknown"),
+                "source": doc.metadata.get("source", "unknown"),
+                "content": doc.page_content
+            }
+        )
+
+    return results
+
+
+# ===============================
+# ASK
+# ===============================
+
 @app.post("/ask")
 def ask(question: Question):
     if not os.path.exists(DB_DIR):
         return {"error": "Vector database not initialized yet. Upload a PDF first."}
+
+    corpus = load_pages_corpus()
+    if not corpus:
+        return {"error": "Page corpus not initialized yet. Upload a PDF first."}
 
     embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
 
@@ -159,39 +187,31 @@ def ask(question: Question):
         openai_api_key=OPENAI_API_KEY
     )
 
-    corpus = load_pages_corpus()
     expanded_queries = expand_query(question.query, llm)
 
-    all_vector_docs: List[Document] = []
-    all_bm25_docs: List[Document] = []
+    all_hits: List[Dict[str, Any]] = []
 
     for q in expanded_queries:
         try:
-            vector_docs = db.max_marginal_relevance_search(
-                q,
-                k=6,
-                fetch_k=20
-            )
-            all_vector_docs.extend(vector_docs)
+            all_hits.extend(vector_search(db, q, k=10, fetch_k=40))
         except Exception:
             pass
 
         try:
-            keyword_docs = bm25_search(q, corpus, k=6)
-            all_bm25_docs.extend(keyword_docs)
+            all_hits.extend(bm25_search(q, corpus, k=10))
         except Exception:
             pass
 
-    merged_docs = unique_docs(all_vector_docs + all_bm25_docs)
+    merged_hits = unique_hits(all_hits)
 
-    if not merged_docs:
+    if not merged_hits:
         return {
             "answer": "No documents retrieved from database.",
             "sources": [],
             "retrieved_chunks_preview": []
         }
 
-    context = build_context(merged_docs, max_docs=8)
+    context = build_context(merged_hits, max_docs=8)
 
     prompt = f"""
 You are an engineering assistant working with technical standards.
@@ -221,16 +241,20 @@ Context:
         "answer": answer_text,
         "sources": [
             {
-                "page": doc.metadata.get("page", "unknown"),
-                "source": doc.metadata.get("source", "unknown")
+                "page": hit["page"],
+                "source": hit["source"]
             }
-            for doc in merged_docs[:8]
+            for hit in merged_hits[:8]
         ],
         "retrieved_chunks_preview": [
-            doc.page_content[:700] for doc in merged_docs[:8]
+            hit["content"][:700] for hit in merged_hits[:8]
         ]
     }
 
+
+# ===============================
+# UPLOAD
+# ===============================
 
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
@@ -252,11 +276,12 @@ async def upload_pdf(file: UploadFile = File(...)):
     if not documents:
         return {"error": "PDF parsing failed or document is empty"}
 
-    cleaned_documents: List[Document] = []
-    pages_payload: List[Dict[str, Any]] = []
+    cleaned_documents = []
+    pages_corpus = []
 
     for doc in documents:
         cleaned_text = normalize_text(doc.page_content)
+
         if not cleaned_text:
             continue
 
@@ -265,24 +290,22 @@ async def upload_pdf(file: UploadFile = File(...)):
             "page": doc.metadata.get("page", "unknown")
         }
 
-        cleaned_doc = Document(
-            page_content=cleaned_text,
-            metadata=metadata
-        )
-        cleaned_documents.append(cleaned_doc)
+        doc.page_content = cleaned_text
+        doc.metadata = metadata
+        cleaned_documents.append(doc)
 
-        pages_payload.append(
+        pages_corpus.append(
             {
-                "page_content": cleaned_text,
-                "metadata": metadata
+                "page": metadata["page"],
+                "source": metadata["source"],
+                "content": cleaned_text
             }
         )
 
     if not cleaned_documents:
         return {"error": "No valid text extracted from PDF"}
 
-    with open(PAGES_JSON, "w", encoding="utf-8") as f:
-        json.dump(pages_payload, f, ensure_ascii=False, indent=2)
+    save_pages_corpus(pages_corpus)
 
     embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
 

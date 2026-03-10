@@ -5,7 +5,6 @@ from pydantic import BaseModel
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import PyMuPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 app = FastAPI()
 
@@ -116,27 +115,18 @@ async def upload_pdf(file: UploadFile = File(...)):
     if not documents:
         return {"error": "PDF parsing failed or document is empty"}
 
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=2000,
-        chunk_overlap=300,
-        separators=[
-            "\nSECTION ",
-            "\nSection ",
-            "\nCHAPTER ",
-            "\nChapter ",
-            "\n\n",
-            "\n",
-            ". ",
-            " "
-        ]
-    )
+    # Page-level indexing
+    cleaned_documents = []
 
-    splits = text_splitter.split_documents(documents)
+    for doc in documents:
+        text = " ".join(doc.page_content.split())
+        doc.page_content = text
+        cleaned_documents.append(doc)
 
     embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
 
     Chroma.from_documents(
-        splits,
+        cleaned_documents,
         embeddings,
         persist_directory=DB_DIR
     )

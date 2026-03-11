@@ -95,6 +95,11 @@ def extract_annex_hint(text: str) -> str:
     return match.group(0) if match else ""
 
 
+def extract_figure_hint(text: str) -> str:
+    match = re.search(r"\bFigure\s+\d+[A-Za-z\-]*\b", text, flags=re.IGNORECASE)
+    return match.group(0) if match else ""
+
+
 # ===============================
 # FORMULA HELPERS
 # ===============================
@@ -205,6 +210,59 @@ def extract_json_block(text: str) -> Dict[str, Any]:
 
 
 # ===============================
+# QUESTION TYPE
+# ===============================
+
+def classify_question_type(query: str) -> str:
+    q = query.lower()
+
+    table_keywords = [
+        "table",
+        "row",
+        "category",
+        "casting factor",
+        "severity level",
+        "drain pipe size",
+        "dimensions",
+        "tolerances",
+        "value from the relevant table",
+        "quote the table",
+    ]
+
+    formula_keywords = [
+        "formula",
+        "equation",
+        "calculate",
+        "calculation",
+        "correction factor",
+        "multiplier",
+        "write the equation",
+        "allowable nozzle forces and moments",
+    ]
+
+    procedure_keywords = [
+        "procedure",
+        "describe the procedure",
+        "verification",
+        "verify",
+        "worksheet",
+        "steps",
+        "how do you verify",
+    ]
+
+    if any(k in q for k in table_keywords):
+        return "table"
+
+    if any(k in q for k in formula_keywords):
+        return "formula"
+
+    if any(k in q for k in procedure_keywords):
+        return "procedure"
+
+    return "fact"
+
+
+# ===============================
 # RETRIEVAL HELPERS
 # ===============================
 
@@ -237,6 +295,7 @@ def build_context(hits: List[Dict[str, Any]], max_docs: int = 10) -> str:
         section_hint = hit.get("section_hint", "")
         table_hint = hit.get("table_hint", "")
         annex_hint = hit.get("annex_hint", "")
+        figure_hint = hit.get("figure_hint", "")
 
         meta_parts = [
             f"page={hit['page']}",
@@ -250,6 +309,8 @@ def build_context(hits: List[Dict[str, Any]], max_docs: int = 10) -> str:
             meta_parts.append(f"table_hint={table_hint}")
         if annex_hint:
             meta_parts.append(f"annex_hint={annex_hint}")
+        if figure_hint:
+            meta_parts.append(f"figure_hint={figure_hint}")
 
         parts.append(
             f"[Document {i} | {' | '.join(meta_parts)}]\n{hit['content']}"
@@ -274,11 +335,7 @@ def bm25_search(query: str, corpus: List[Dict[str, Any]], k: int = 10) -> List[D
         reverse=True
     )[:k]
 
-    results = []
-    for idx in ranked_indices:
-        results.append(corpus[idx])
-
-    return results
+    return [corpus[idx] for idx in ranked_indices]
 
 
 def vector_search(db: Chroma, query: str, k: int = 10, fetch_k: int = 40) -> List[Dict[str, Any]]:
@@ -294,6 +351,7 @@ def vector_search(db: Chroma, query: str, k: int = 10, fetch_k: int = 40) -> Lis
                 "section_hint": doc.metadata.get("section_hint", ""),
                 "table_hint": doc.metadata.get("table_hint", ""),
                 "annex_hint": doc.metadata.get("annex_hint", ""),
+                "figure_hint": doc.metadata.get("figure_hint", ""),
                 "content": doc.page_content
             }
         )
@@ -327,38 +385,37 @@ def heuristic_expansions(query: str) -> List[str]:
         expansions.extend([
             "API 617 external thrust force gear coupling formula",
             "API 617 gear coupling external force equation",
-            "API 617 annex k external forces and moments gear couplings",
+            "API 617 annex external forces and moments gear couplings",
             "external thrust force allowable gear coupling API 617",
             "formula external thrust gear couplings rated power speed shaft diameter",
-            "API 617 external thrust force equation gear couplings",
-            "external force on gear couplings API 617",
         ])
 
     if "shaft vibration" in q and "mechanical running test" in q:
         expansions.extend([
             "API 617 mechanical running test shaft vibration limit",
-            "API 617 mechanical test vibration limit Avl",
+            "API 617 mechanical test vibration limit A_vl",
             "API 617 A_vl equation",
             "API 617 equation 8 A_vl",
             "API 617 maximum allowable shaft vibration equation",
-            "API 617 allowable shaft vibration mechanical running test",
-            "API 617 peak to peak amplitude unfiltered shaft vibration",
             "API 617 25.4 um 1.0 mil shaft vibration",
             "API 617 N_mc A_vl",
-            "mechanical running test maximum allowable shaft vibration peak to peak",
-            "API 617 mechanical test vibration limit equation 8",
-            "A_vl maximum continuous speed N_mc API 617",
         ])
 
-    if "equation" in q or "formula" in q or "write the equation" in q:
+    if "table" in q or "category" in q or "casting factor" in q or "severity level" in q:
+        expansions.extend([
+            query,
+            "API 617 relevant table exact row value",
+            "API 617 table value condition",
+            "API 617 exact table lookup",
+        ])
+
+    if "formula" in q or "equation" in q or "write the equation" in q:
         expansions.extend([
             query,
             "API 617 equation formula exact expression",
-            "API 617 equation 8 formula",
             "API 617 explicit formula",
-            "API 617 A_vl formula N_mc",
-            "API 617 where N_mc is maximum continuous speed",
-            "API 617 formula where N_mc",
+            "API 617 correction factor formula",
+            "API 617 annex formula",
         ])
 
     return list(dict.fromkeys(expansions))
@@ -399,30 +456,79 @@ def build_query_set(query: str, llm: ChatOpenAI) -> List[str]:
 
 
 # ===============================
-# ANSWER EXTRACTION
+# EXTRACTION
 # ===============================
 
-def answer_from_context(question: str, hits: List[Dict[str, Any]], llm: ChatOpenAI) -> Dict[str, Any]:
-    context = build_context(hits, max_docs=10)
-
-    q_lower = question.lower()
-    wants_formula = any(
-        phrase in q_lower
-        for phrase in [
-            "formula",
-            "equation",
-            "write the equation",
-            "give the equation",
-            "show the equation",
-        ]
-    )
-
-    if wants_formula:
-        prompt = f"""
+def extraction_prompt_for_mode(question: str, context: str, mode: str) -> str:
+    if mode == "table":
+        return f"""
 You are an engineering assistant working with technical standards.
 
 Use ONLY the provided context.
-Do not invent formulas, values, units, limits, section numbers, table numbers, or annexes.
+Do not invent values, categories, units, conditions, sections, tables, annexes, figures, or formulas.
+
+The user is asking a TABLE-STYLE question.
+Your job is to extract the exact value or category from the context if it is explicitly present.
+
+Return ONLY valid JSON with this schema:
+
+{{
+  "answer": "short engineering answer in plain English",
+  "value": "",
+  "units": "",
+  "condition": "",
+  "table_row": "short description of the matched row or matched condition",
+  "formula_plain": "",
+  "formula_latex": "",
+  "variables": [],
+  "reference": {{
+    "section": "",
+    "table": "",
+    "annex": "",
+    "figure": "",
+    "page": ""
+  }},
+  "found": true
+}}
+
+Rules:
+- If the exact value/category is present, extract it directly.
+- If the context only says 'see Table X' but does not include the actual row value, return found=false.
+- Do NOT answer with just 'specified in Table X' unless the actual value is explicitly visible in the context.
+- If not found, return exactly:
+
+{{
+  "answer": "Not found in the provided standard excerpt.",
+  "value": "",
+  "units": "",
+  "condition": "",
+  "table_row": "",
+  "formula_plain": "",
+  "formula_latex": "",
+  "variables": [],
+  "reference": {{
+    "section": "",
+    "table": "",
+    "annex": "",
+    "figure": "",
+    "page": ""
+  }},
+  "found": false
+}}
+
+Question:
+{question}
+
+Context:
+{context}
+"""
+
+    if mode == "formula":
+        return f"""
+You are an engineering assistant working with technical standards.
+
+Use ONLY the provided context.
+Do not invent formulas, values, units, limits, section numbers, table numbers, annexes, or correction factors.
 
 The user is specifically asking for an equation or formula.
 
@@ -430,58 +536,41 @@ Return ONLY valid JSON with this schema:
 
 {{
   "answer": "short engineering answer in plain English",
-  "formula_plain": "formula in readable plain text, for example: A_vl = min((25.4 * 12000 / N_mc), 25.4)",
-  "formula_latex": "formula in proper LaTeX if available, otherwise empty string",
+  "value": "",
+  "units": "",
+  "condition": "",
+  "table_row": "",
+  "formula_plain": "formula in readable plain text",
+  "formula_latex": "formula in proper LaTeX if available",
   "variables": [
     {{
-      "symbol": "N_mc",
-      "meaning": "maximum continuous speed",
-      "units": "rpm"
+      "symbol": "",
+      "meaning": "",
+      "units": ""
     }}
   ],
   "reference": {{
     "section": "",
     "table": "",
     "annex": "",
+    "figure": "",
     "page": ""
   }},
   "found": true
 }}
 
 Rules:
-- If the context contains only a limit statement but NO explicit formula, do NOT invent a formula.
-- If the context contains a formula, extract that formula only from the context.
-- If the context does not explicitly contain a formula, return found=false.
-- Do NOT answer with a different nearby requirement from another section.
-- formula_plain must be plain readable text, not LaTeX.
+- If the context contains only a prose requirement but no explicit formula, return found=false.
+- If a correction factor is explicitly present, include it in answer or formula_plain.
+- Do NOT reconstruct a formula unless it is explicitly supported by context.
 - If not found, return exactly:
 
 {{
   "answer": "Not found in the provided standard excerpt.",
-  "formula_plain": "",
-  "formula_latex": "",
-  "variables": [],
-  "reference": {{"section": "", "table": "", "annex": "", "page": ""}},
-  "found": false
-}}
-
-Question:
-{question}
-
-Context:
-{context}
-"""
-    else:
-        prompt = f"""
-You are an engineering assistant working with technical standards.
-
-Use ONLY the provided context.
-Do not invent formulas, values, units, limits, section numbers, table numbers, or annexes.
-
-Return ONLY valid JSON with this schema:
-
-{{
-  "answer": "short engineering answer in plain English",
+  "value": "",
+  "units": "",
+  "condition": "",
+  "table_row": "",
   "formula_plain": "",
   "formula_latex": "",
   "variables": [],
@@ -489,22 +578,9 @@ Return ONLY valid JSON with this schema:
     "section": "",
     "table": "",
     "annex": "",
+    "figure": "",
     "page": ""
   }},
-  "found": true
-}}
-
-Rules:
-- Answer only what is explicitly supported by the context.
-- Do NOT substitute a nearby but different requirement.
-- If the answer is not explicitly supported by the context, return exactly:
-
-{{
-  "answer": "Not found in the provided standard excerpt.",
-  "formula_plain": "",
-  "formula_latex": "",
-  "variables": [],
-  "reference": {{"section": "", "table": "", "annex": "", "page": ""}},
   "found": false
 }}
 
@@ -514,6 +590,131 @@ Question:
 Context:
 {context}
 """
+
+    if mode == "procedure":
+        return f"""
+You are an engineering assistant working with technical standards.
+
+Use ONLY the provided context.
+Do not invent steps, worksheets, section numbers, annexes, or requirements.
+
+The user is asking for a procedure.
+
+Return ONLY valid JSON with this schema:
+
+{{
+  "answer": "clear procedural summary in plain English",
+  "value": "",
+  "units": "",
+  "condition": "",
+  "table_row": "",
+  "formula_plain": "",
+  "formula_latex": "",
+  "variables": [],
+  "reference": {{
+    "section": "",
+    "table": "",
+    "annex": "",
+    "figure": "",
+    "page": ""
+  }},
+  "found": true
+}}
+
+Rules:
+- Summarize only steps explicitly supported by context.
+- If worksheets or multipliers are explicitly mentioned, include them in answer.
+- If not found, return exactly:
+
+{{
+  "answer": "Not found in the provided standard excerpt.",
+  "value": "",
+  "units": "",
+  "condition": "",
+  "table_row": "",
+  "formula_plain": "",
+  "formula_latex": "",
+  "variables": [],
+  "reference": {{
+    "section": "",
+    "table": "",
+    "annex": "",
+    "figure": "",
+    "page": ""
+  }},
+  "found": false
+}}
+
+Question:
+{question}
+
+Context:
+{context}
+"""
+
+    return f"""
+You are an engineering assistant working with technical standards.
+
+Use ONLY the provided context.
+Do not invent values, units, conditions, section numbers, table numbers, annexes, or figures.
+
+Return ONLY valid JSON with this schema:
+
+{{
+  "answer": "short engineering answer in plain English",
+  "value": "",
+  "units": "",
+  "condition": "",
+  "table_row": "",
+  "formula_plain": "",
+  "formula_latex": "",
+  "variables": [],
+  "reference": {{
+    "section": "",
+    "table": "",
+    "annex": "",
+    "figure": "",
+    "page": ""
+  }},
+  "found": true
+}}
+
+Rules:
+- Answer only what is explicitly supported by context.
+- Do NOT substitute a nearby but different requirement.
+- If not found, return exactly:
+
+{{
+  "answer": "Not found in the provided standard excerpt.",
+  "value": "",
+  "units": "",
+  "condition": "",
+  "table_row": "",
+  "formula_plain": "",
+  "formula_latex": "",
+  "variables": [],
+  "reference": {{
+    "section": "",
+    "table": "",
+    "annex": "",
+    "figure": "",
+    "page": ""
+  }},
+  "found": false
+}}
+
+Question:
+{question}
+
+Context:
+{context}
+"""
+
+
+def answer_from_context(question: str, hits: List[Dict[str, Any]], llm: ChatOpenAI) -> Dict[str, Any]:
+    context = build_context(hits, max_docs=10)
+    mode = classify_question_type(question)
+    prompt = extraction_prompt_for_mode(question, context, mode)
 
     try:
         response = llm.invoke(prompt)
@@ -522,32 +723,48 @@ Context:
         if not parsed:
             return {
                 "answer": "Not found in the provided standard excerpt.",
+                "value": "",
+                "units": "",
+                "condition": "",
+                "table_row": "",
                 "formula_plain": "",
                 "formula_latex": "",
                 "variables": [],
-                "reference": {"section": "", "table": "", "annex": "", "page": ""},
-                "found": False
+                "reference": {"section": "", "table": "", "annex": "", "figure": "", "page": ""},
+                "found": False,
+                "mode": mode
             }
 
+        parsed["mode"] = mode
         return parsed
+
     except Exception:
         return {
             "answer": "Not found in the provided standard excerpt.",
+            "value": "",
+            "units": "",
+            "condition": "",
+            "table_row": "",
             "formula_plain": "",
             "formula_latex": "",
             "variables": [],
-            "reference": {"section": "", "table": "", "annex": "", "page": ""},
-            "found": False
+            "reference": {"section": "", "table": "", "annex": "", "figure": "", "page": ""},
+            "found": False,
+            "mode": mode
         }
 
 
 def second_pass_queries(question: str, llm: ChatOpenAI) -> List[str]:
+    mode = classify_question_type(question)
+
     prompt = f"""
 Generate up to 6 very short keyword-heavy retrieval queries
 for finding the exact answer in a technical standard.
 
+Question mode: {mode}
+
 Rules:
-- Focus on section-style wording, equations, limits, exact variables, tables, annexes, and exact terms.
+- Focus on exact sections, exact tables, exact annexes, exact row conditions, formulas, and variables.
 - Return only the queries, one per line.
 - Do not explain anything.
 
@@ -588,6 +805,7 @@ def ask(question: Question):
         openai_api_key=OPENAI_API_KEY
     )
 
+    mode = classify_question_type(question.query)
     query_set = build_query_set(question.query, llm)
 
     vector_result_lists: List[List[Dict[str, Any]]] = []
@@ -610,11 +828,16 @@ def ask(question: Question):
     if not fused_hits:
         return {
             "answer": "No documents retrieved from database.",
+            "value": "",
+            "units": "",
+            "condition": "",
+            "table_row": "",
             "formula_plain": "",
             "formula_latex": "",
             "formula_pretty_from_latex": "",
             "variables": [],
-            "reference": {"section": "", "table": "", "annex": "", "page": ""},
+            "reference": {"section": "", "table": "", "annex": "", "figure": "", "page": ""},
+            "mode": mode,
             "sources": [],
             "retrieved_chunks_preview": [],
             "queries_used": query_set
@@ -652,14 +875,19 @@ def ask(question: Question):
 
     return {
         "answer": answer_obj.get("answer", "Not found in the provided standard excerpt."),
+        "value": answer_obj.get("value", ""),
+        "units": answer_obj.get("units", ""),
+        "condition": answer_obj.get("condition", ""),
+        "table_row": answer_obj.get("table_row", ""),
         "formula_plain": answer_obj.get("formula_plain", ""),
         "formula_latex": formula_latex,
         "formula_pretty_from_latex": formula_pretty,
         "variables": answer_obj.get("variables", []),
         "reference": answer_obj.get(
             "reference",
-            {"section": "", "table": "", "annex": "", "page": ""}
+            {"section": "", "table": "", "annex": "", "figure": "", "page": ""}
         ),
+        "mode": answer_obj.get("mode", mode),
         "sources": [
             {
                 "page": hit["page"],
@@ -667,7 +895,8 @@ def ask(question: Question):
                 "chunk_id": hit.get("chunk_id", ""),
                 "section_hint": hit.get("section_hint", ""),
                 "table_hint": hit.get("table_hint", ""),
-                "annex_hint": hit.get("annex_hint", "")
+                "annex_hint": hit.get("annex_hint", ""),
+                "figure_hint": hit.get("figure_hint", ""),
             }
             for hit in fused_hits[:10]
         ],
@@ -751,6 +980,7 @@ async def upload_pdf(file: UploadFile = File(...)):
             section_hint = extract_section_hint(chunk_text)
             table_hint = extract_table_hint(chunk_text)
             annex_hint = extract_annex_hint(chunk_text)
+            figure_hint = extract_figure_hint(chunk_text)
 
             metadata = {
                 "source": source,
@@ -759,6 +989,7 @@ async def upload_pdf(file: UploadFile = File(...)):
                 "section_hint": section_hint,
                 "table_hint": table_hint,
                 "annex_hint": annex_hint,
+                "figure_hint": figure_hint,
             }
 
             split_doc.page_content = chunk_text
@@ -773,6 +1004,7 @@ async def upload_pdf(file: UploadFile = File(...)):
                     "section_hint": section_hint,
                     "table_hint": table_hint,
                     "annex_hint": annex_hint,
+                    "figure_hint": figure_hint,
                     "content": chunk_text
                 }
             )

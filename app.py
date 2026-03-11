@@ -10,6 +10,8 @@ from rank_bm25 import BM25Okapi
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
 
 app = FastAPI()
 
@@ -65,27 +67,62 @@ def save_pages_corpus(corpus: List[Dict[str, Any]]) -> None:
 
 
 # ===============================
+# METADATA HELPERS
+# ===============================
+
+def extract_section_hint(text: str) -> str:
+    patterns = [
+        r"\b\d+\.\d+\.\d+\.\d+\b",
+        r"\b\d+\.\d+\.\d+\b",
+        r"\b\d+\.\d+\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(0)
+
+    return ""
+
+
+def extract_table_hint(text: str) -> str:
+    match = re.search(r"\bTable\s+\d+[A-Za-z\-]*\b", text, flags=re.IGNORECASE)
+    return match.group(0) if match else ""
+
+
+def extract_annex_hint(text: str) -> str:
+    match = re.search(r"\bAnnex\s+[A-Z]\b", text, flags=re.IGNORECASE)
+    return match.group(0) if match else ""
+
+
+# ===============================
 # FORMULA HELPERS
 # ===============================
 
 def clean_latex_escapes(text: str) -> str:
-    text = text.replace("\\\\[", "\\[")
-    text = text.replace("\\\\]", "\\]")
-    text = text.replace("\\\\(", "\\(")
-    text = text.replace("\\\\)", "\\)")
-    text = text.replace("\\\\frac", "\\frac")
-    text = text.replace("\\\\times", "\\times")
-    text = text.replace("\\\\cdot", "\\cdot")
-    text = text.replace("\\\\mu", "\\mu")
-    text = text.replace("\\\\alpha", "\\alpha")
-    text = text.replace("\\\\beta", "\\beta")
-    text = text.replace("\\\\gamma", "\\gamma")
-    text = text.replace("\\\\Delta", "\\Delta")
-    text = text.replace("\\\\delta", "\\delta")
-    text = text.replace("\\\\min", "\\min")
-    text = text.replace("\\\\max", "\\max")
-    text = text.replace("\\\\left", "\\left")
-    text = text.replace("\\\\right", "\\right")
+    replacements = {
+        "\\\\[": "\\[",
+        "\\\\]": "\\]",
+        "\\\\(": "\\(",
+        "\\\\)": "\\)",
+        "\\\\frac": "\\frac",
+        "\\\\times": "\\times",
+        "\\\\cdot": "\\cdot",
+        "\\\\mu": "\\mu",
+        "\\\\alpha": "\\alpha",
+        "\\\\beta": "\\beta",
+        "\\\\gamma": "\\gamma",
+        "\\\\Delta": "\\Delta",
+        "\\\\delta": "\\delta",
+        "\\\\min": "\\min",
+        "\\\\max": "\\max",
+        "\\\\left": "\\left",
+        "\\\\right": "\\right",
+    }
+
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
     return text
 
 
@@ -197,8 +234,25 @@ def build_context(hits: List[Dict[str, Any]], max_docs: int = 10) -> str:
     parts = []
 
     for i, hit in enumerate(selected, start=1):
+        section_hint = hit.get("section_hint", "")
+        table_hint = hit.get("table_hint", "")
+        annex_hint = hit.get("annex_hint", "")
+
+        meta_parts = [
+            f"page={hit['page']}",
+            f"source={hit['source']}",
+            f"chunk_id={hit.get('chunk_id', 'unknown')}"
+        ]
+
+        if section_hint:
+            meta_parts.append(f"section_hint={section_hint}")
+        if table_hint:
+            meta_parts.append(f"table_hint={table_hint}")
+        if annex_hint:
+            meta_parts.append(f"annex_hint={annex_hint}")
+
         parts.append(
-            f"[Document {i} | page={hit['page']} | source={hit['source']}]\n{hit['content']}"
+            f"[Document {i} | {' | '.join(meta_parts)}]\n{hit['content']}"
         )
 
     return "\n\n".join(parts)
@@ -222,18 +276,13 @@ def bm25_search(query: str, corpus: List[Dict[str, Any]], k: int = 10) -> List[D
 
     results = []
     for idx in ranked_indices:
-        item = corpus[idx]
-        results.append(item)
+        results.append(corpus[idx])
 
     return results
 
 
 def vector_search(db: Chroma, query: str, k: int = 10, fetch_k: int = 40) -> List[Dict[str, Any]]:
-    docs = db.max_marginal_relevance_search(
-        query,
-        k=k,
-        fetch_k=fetch_k
-    )
+    docs = db.max_marginal_relevance_search(query, k=k, fetch_k=fetch_k)
 
     results = []
     for doc in docs:
@@ -241,6 +290,10 @@ def vector_search(db: Chroma, query: str, k: int = 10, fetch_k: int = 40) -> Lis
             {
                 "page": doc.metadata.get("page", "unknown"),
                 "source": doc.metadata.get("source", "unknown"),
+                "chunk_id": doc.metadata.get("chunk_id", "unknown"),
+                "section_hint": doc.metadata.get("section_hint", ""),
+                "table_hint": doc.metadata.get("table_hint", ""),
+                "annex_hint": doc.metadata.get("annex_hint", ""),
                 "content": doc.page_content
             }
         )
@@ -276,18 +329,36 @@ def heuristic_expansions(query: str) -> List[str]:
             "API 617 gear coupling external force equation",
             "API 617 annex k external forces and moments gear couplings",
             "external thrust force allowable gear coupling API 617",
-            "formula external thrust gear couplings rated power speed shaft diameter"
+            "formula external thrust gear couplings rated power speed shaft diameter",
+            "API 617 external thrust force equation gear couplings",
+            "external force on gear couplings API 617",
         ])
 
     if "shaft vibration" in q and "mechanical running test" in q:
         expansions.extend([
             "API 617 mechanical running test shaft vibration limit",
+            "API 617 mechanical test vibration limit Avl",
+            "API 617 A_vl equation",
+            "API 617 equation 8 A_vl",
+            "API 617 maximum allowable shaft vibration equation",
             "API 617 allowable shaft vibration mechanical running test",
             "API 617 peak to peak amplitude unfiltered shaft vibration",
-            "API 617 equation 13 shaft vibration",
             "API 617 25.4 um 1.0 mil shaft vibration",
-            "API 617 6.8.9 shaft vibration mechanical running test",
-            "mechanical running test maximum allowable shaft vibration peak to peak"
+            "API 617 N_mc A_vl",
+            "mechanical running test maximum allowable shaft vibration peak to peak",
+            "API 617 mechanical test vibration limit equation 8",
+            "A_vl maximum continuous speed N_mc API 617",
+        ])
+
+    if "equation" in q or "formula" in q or "write the equation" in q:
+        expansions.extend([
+            query,
+            "API 617 equation formula exact expression",
+            "API 617 equation 8 formula",
+            "API 617 explicit formula",
+            "API 617 A_vl formula N_mc",
+            "API 617 where N_mc is maximum continuous speed",
+            "API 617 formula where N_mc",
         ])
 
     return list(dict.fromkeys(expansions))
@@ -334,15 +405,28 @@ def build_query_set(query: str, llm: ChatOpenAI) -> List[str]:
 def answer_from_context(question: str, hits: List[Dict[str, Any]], llm: ChatOpenAI) -> Dict[str, Any]:
     context = build_context(hits, max_docs=10)
 
-    prompt = f"""
+    q_lower = question.lower()
+    wants_formula = any(
+        phrase in q_lower
+        for phrase in [
+            "formula",
+            "equation",
+            "write the equation",
+            "give the equation",
+            "show the equation",
+        ]
+    )
+
+    if wants_formula:
+        prompt = f"""
 You are an engineering assistant working with technical standards.
 
 Use ONLY the provided context.
-Do not invent formulas, values, units, limits, or section numbers.
+Do not invent formulas, values, units, limits, section numbers, table numbers, or annexes.
 
-Return ONLY valid JSON.
+The user is specifically asking for an equation or formula.
 
-If the answer is explicitly present in the context, return exactly this schema:
+Return ONLY valid JSON with this schema:
 
 {{
   "answer": "short engineering answer in plain English",
@@ -355,20 +439,29 @@ If the answer is explicitly present in the context, return exactly this schema:
       "units": "rpm"
     }}
   ],
+  "reference": {{
+    "section": "",
+    "table": "",
+    "annex": "",
+    "page": ""
+  }},
   "found": true
 }}
 
 Rules:
-- formula_plain must be readable plain text, not LaTeX
-- formula_plain must use operators like *, /, min(), max()
-- if there is no formula, set formula_plain and formula_latex to empty strings
-- if the answer is not explicitly supported by the context, return exactly:
+- If the context contains only a limit statement but NO explicit formula, do NOT invent a formula.
+- If the context contains a formula, extract that formula only from the context.
+- If the context does not explicitly contain a formula, return found=false.
+- Do NOT answer with a different nearby requirement from another section.
+- formula_plain must be plain readable text, not LaTeX.
+- If not found, return exactly:
 
 {{
   "answer": "Not found in the provided standard excerpt.",
   "formula_plain": "",
   "formula_latex": "",
   "variables": [],
+  "reference": {{"section": "", "table": "", "annex": "", "page": ""}},
   "found": false
 }}
 
@@ -378,6 +471,50 @@ Question:
 Context:
 {context}
 """
+    else:
+        prompt = f"""
+You are an engineering assistant working with technical standards.
+
+Use ONLY the provided context.
+Do not invent formulas, values, units, limits, section numbers, table numbers, or annexes.
+
+Return ONLY valid JSON with this schema:
+
+{{
+  "answer": "short engineering answer in plain English",
+  "formula_plain": "",
+  "formula_latex": "",
+  "variables": [],
+  "reference": {{
+    "section": "",
+    "table": "",
+    "annex": "",
+    "page": ""
+  }},
+  "found": true
+}}
+
+Rules:
+- Answer only what is explicitly supported by the context.
+- Do NOT substitute a nearby but different requirement.
+- If the answer is not explicitly supported by the context, return exactly:
+
+{{
+  "answer": "Not found in the provided standard excerpt.",
+  "formula_plain": "",
+  "formula_latex": "",
+  "variables": [],
+  "reference": {{"section": "", "table": "", "annex": "", "page": ""}},
+  "found": false
+}}
+
+Question:
+{question}
+
+Context:
+{context}
+"""
+
     try:
         response = llm.invoke(prompt)
         parsed = extract_json_block(response.content)
@@ -388,6 +525,7 @@ Context:
                 "formula_plain": "",
                 "formula_latex": "",
                 "variables": [],
+                "reference": {"section": "", "table": "", "annex": "", "page": ""},
                 "found": False
             }
 
@@ -398,6 +536,7 @@ Context:
             "formula_plain": "",
             "formula_latex": "",
             "variables": [],
+            "reference": {"section": "", "table": "", "annex": "", "page": ""},
             "found": False
         }
 
@@ -408,7 +547,7 @@ Generate up to 6 very short keyword-heavy retrieval queries
 for finding the exact answer in a technical standard.
 
 Rules:
-- Focus on section-style wording, equations, limits, and exact terms.
+- Focus on section-style wording, equations, limits, exact variables, tables, annexes, and exact terms.
 - Return only the queries, one per line.
 - Do not explain anything.
 
@@ -458,12 +597,12 @@ def ask(question: Question):
         try:
             vector_result_lists.append(vector_search(db, q, k=10, fetch_k=40))
         except Exception:
-            continue
+            pass
 
         try:
             bm25_result_lists.append(bm25_search(q, corpus, k=10))
         except Exception:
-            continue
+            pass
 
     fused_hits = rrf_fuse(vector_result_lists + bm25_result_lists)
     fused_hits = unique_hits(fused_hits)
@@ -475,6 +614,7 @@ def ask(question: Question):
             "formula_latex": "",
             "formula_pretty_from_latex": "",
             "variables": [],
+            "reference": {"section": "", "table": "", "annex": "", "page": ""},
             "sources": [],
             "retrieved_chunks_preview": [],
             "queries_used": query_set
@@ -516,10 +656,18 @@ def ask(question: Question):
         "formula_latex": formula_latex,
         "formula_pretty_from_latex": formula_pretty,
         "variables": answer_obj.get("variables", []),
+        "reference": answer_obj.get(
+            "reference",
+            {"section": "", "table": "", "annex": "", "page": ""}
+        ),
         "sources": [
             {
                 "page": hit["page"],
-                "source": hit["source"]
+                "source": hit["source"],
+                "chunk_id": hit.get("chunk_id", ""),
+                "section_hint": hit.get("section_hint", ""),
+                "table_hint": hit.get("table_hint", ""),
+                "annex_hint": hit.get("annex_hint", "")
             }
             for hit in fused_hits[:10]
         ],
@@ -554,48 +702,97 @@ async def upload_pdf(file: UploadFile = File(...)):
     if not documents:
         return {"error": "PDF parsing failed or document is empty"}
 
-    cleaned_documents = []
-    pages_corpus = []
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1200,
+        chunk_overlap=200,
+        separators=[
+            "\nAnnex ",
+            "\nANNEX ",
+            "\nTable ",
+            "\nTABLE ",
+            "\nFigure ",
+            "\nFIGURE ",
+            "\n\n",
+            "\n",
+            ". ",
+            " "
+        ]
+    )
+
+    chunk_documents: List[Document] = []
+    corpus_items: List[Dict[str, Any]] = []
+    chunk_counter = 0
 
     for doc in documents:
-        cleaned_text = normalize_text(doc.page_content)
-
-        if not cleaned_text:
+        cleaned_page_text = normalize_text(doc.page_content)
+        if not cleaned_page_text:
             continue
 
-        metadata = {
-            "source": doc.metadata.get("source", file_path),
-            "page": doc.metadata.get("page", "unknown")
-        }
+        page = doc.metadata.get("page", "unknown")
+        source = doc.metadata.get("source", file_path)
 
-        doc.page_content = cleaned_text
-        doc.metadata = metadata
-        cleaned_documents.append(doc)
-
-        pages_corpus.append(
-            {
-                "page": metadata["page"],
-                "source": metadata["source"],
-                "content": cleaned_text
+        page_doc = Document(
+            page_content=cleaned_page_text,
+            metadata={
+                "source": source,
+                "page": page
             }
         )
 
-    if not cleaned_documents:
+        splits = splitter.split_documents([page_doc])
+
+        for split_doc in splits:
+            chunk_counter += 1
+            chunk_text = normalize_text(split_doc.page_content)
+
+            if not chunk_text:
+                continue
+
+            section_hint = extract_section_hint(chunk_text)
+            table_hint = extract_table_hint(chunk_text)
+            annex_hint = extract_annex_hint(chunk_text)
+
+            metadata = {
+                "source": source,
+                "page": page,
+                "chunk_id": chunk_counter,
+                "section_hint": section_hint,
+                "table_hint": table_hint,
+                "annex_hint": annex_hint,
+            }
+
+            split_doc.page_content = chunk_text
+            split_doc.metadata = metadata
+            chunk_documents.append(split_doc)
+
+            corpus_items.append(
+                {
+                    "page": page,
+                    "source": source,
+                    "chunk_id": chunk_counter,
+                    "section_hint": section_hint,
+                    "table_hint": table_hint,
+                    "annex_hint": annex_hint,
+                    "content": chunk_text
+                }
+            )
+
+    if not chunk_documents:
         return {"error": "No valid text extracted from PDF"}
 
-    save_pages_corpus(pages_corpus)
+    save_pages_corpus(corpus_items)
 
     embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
 
     Chroma.from_documents(
-        cleaned_documents,
+        chunk_documents,
         embeddings,
         persist_directory=DB_DIR
     )
 
     return {
         "status": "PDF uploaded and indexed successfully",
-        "pages_indexed": len(cleaned_documents),
+        "chunks_indexed": len(chunk_documents),
         "file": file.filename
     }
 

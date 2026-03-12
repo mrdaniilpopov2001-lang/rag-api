@@ -1,7 +1,8 @@
 import json
+import math
 import os
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
@@ -123,6 +124,7 @@ def clean_latex_escapes(text: str) -> str:
         "\\\\max": "\\max",
         "\\\\left": "\\left",
         "\\\\right": "\\right",
+        "\\\\text": "\\text",
     }
 
     for old, new in replacements.items():
@@ -184,6 +186,7 @@ def latex_to_pretty_text(latex: str) -> str:
         "\\max": "max",
         "\\left": "",
         "\\right": "",
+        "\\text": "",
     }
 
     for old, new in replacements.items():
@@ -396,6 +399,7 @@ def heuristic_expansions(query: str) -> List[str]:
             "API 617 mechanical test vibration limit A_vl",
             "API 617 A_vl equation",
             "API 617 equation 8 A_vl",
+            "API 617 equation 12b A_vl",
             "API 617 maximum allowable shaft vibration equation",
             "API 617 25.4 um 1.0 mil shaft vibration",
             "API 617 N_mc A_vl",
@@ -780,6 +784,161 @@ Question:
 
 
 # ===============================
+# CALCULATION LAYER
+# ===============================
+
+def extract_numeric_input(question: str, variable_names: List[str]) -> Dict[str, float]:
+    q = question
+    result: Dict[str, float] = {}
+
+    patterns = []
+
+    if "N_mc" in variable_names or "Nmc" in variable_names:
+        patterns.extend([
+            (r"\bN[_ ]?mc\s*[:=]?\s*(\d+(?:\.\d+)?)\s*rpm\b", "N_mc"),
+            (r"\bmaximum continuous speed of\s*(\d+(?:\.\d+)?)\s*rpm\b", "N_mc"),
+            (r"\bmaximum continuous speed\s*[:=]?\s*(\d+(?:\.\d+)?)\s*rpm\b", "N_mc"),
+            (r"\bfor a compressor with a maximum continuous speed of\s*(\d+(?:\.\d+)?)\s*rpm\b", "N_mc"),
+        ])
+
+    for pattern, var_name in patterns:
+        match = re.search(pattern, q, flags=re.IGNORECASE)
+        if match:
+            try:
+                result[var_name] = float(match.group(1))
+            except Exception:
+                pass
+
+    return result
+
+
+def formula_indicates_mechanical_vibration_limit(answer_obj: Dict[str, Any], question: str) -> bool:
+    text = " ".join([
+        str(answer_obj.get("answer", "")),
+        str(answer_obj.get("formula_plain", "")),
+        str(answer_obj.get("formula_latex", "")),
+        question,
+    ]).lower()
+
+    indicators = [
+        "mechanical running test",
+        "mechanical test vibration limit",
+        "shaft vibration amplitude",
+        "maximum permissible shaft vibration amplitude",
+        "a_vl",
+        "avl",
+        "equation 12b",
+        "1.0 mil",
+        "25.4 um",
+    ]
+
+    return any(ind in text for ind in indicators)
+
+
+def question_requests_usc(question: str) -> bool:
+    return "usc" in question.lower()
+
+
+def question_requests_si(question: str) -> bool:
+    q = question.lower()
+    return "si units" in q or "in si" in q or "microm" in q or "μm" in q or "um" in q
+
+
+def calculate_mechanical_vibration_limit(answer_obj: Dict[str, Any], question: str) -> Optional[Dict[str, Any]]:
+    variables = answer_obj.get("variables", [])
+    variable_names = [v.get("symbol", "") for v in variables]
+
+    numeric_inputs = extract_numeric_input(question, variable_names + ["N_mc"])
+
+    if "N_mc" not in numeric_inputs:
+        return None
+
+    n_mc = numeric_inputs["N_mc"]
+    if n_mc <= 0:
+        return None
+
+    usc_value = min(12000.0 / n_mc, 1.0)
+    si_value = min((25.4 * 12000.0) / n_mc, 25.4)
+
+    if question_requests_usc(question):
+        final_value = usc_value
+        final_units = "mil"
+        pretty_formula = "A_vl = min(12000 / N_mc, 1.0)"
+    elif question_requests_si(question):
+        final_value = si_value
+        final_units = "μm"
+        pretty_formula = "A_vl = min((25.4 × 12000 / N_mc), 25.4)"
+    else:
+        # default: use units hinted by answer/formula
+        if "mil" in (answer_obj.get("answer", "") + " " + answer_obj.get("formula_plain", "")).lower():
+            final_value = usc_value
+            final_units = "mil"
+            pretty_formula = "A_vl = min(12000 / N_mc, 1.0)"
+        else:
+            final_value = si_value
+            final_units = "μm"
+            pretty_formula = "A_vl = min((25.4 × 12000 / N_mc), 25.4)"
+
+    calc_steps = {
+        "N_mc": n_mc,
+        "usc_formula_value_12000_over_Nmc": round(12000.0 / n_mc, 6),
+        "usc_limit": 1.0,
+        "usc_final_mil": round(usc_value, 6),
+        "si_formula_value_25_4_times_12000_over_Nmc": round((25.4 * 12000.0) / n_mc, 6),
+        "si_limit_um": 25.4,
+        "si_final_um": round(si_value, 6),
+    }
+
+    return {
+        "calculated": True,
+        "calculation_type": "mechanical_test_vibration_limit",
+        "formula_used_for_calculation": pretty_formula,
+        "inputs": {"N_mc": n_mc},
+        "calculation_steps": calc_steps,
+        "final_value": round(final_value, 6),
+        "final_units": final_units,
+    }
+
+
+def apply_calculation_layer(answer_obj: Dict[str, Any], question: str) -> Dict[str, Any]:
+    if not answer_obj.get("found", False):
+        answer_obj["calculated"] = False
+        return answer_obj
+
+    if not formula_indicates_mechanical_vibration_limit(answer_obj, question):
+        answer_obj["calculated"] = False
+        return answer_obj
+
+    calc_result = calculate_mechanical_vibration_limit(answer_obj, question)
+    if not calc_result:
+        answer_obj["calculated"] = False
+        return answer_obj
+
+    original_answer = answer_obj.get("answer", "").strip()
+    answer_obj["original_answer_before_calculation"] = original_answer
+    answer_obj["calculated"] = True
+    answer_obj["calculation"] = calc_result
+
+    final_value = calc_result["final_value"]
+    final_units = calc_result["final_units"]
+    ref = answer_obj.get("reference", {})
+    section = ref.get("section", "")
+    page = ref.get("page", "")
+
+    answer_obj["value"] = str(final_value)
+    answer_obj["units"] = final_units
+
+    answer_obj["answer"] = (
+        f"The maximum permissible shaft vibration amplitude is {final_value} {final_units}. "
+        f"This was calculated using {calc_result['formula_used_for_calculation']} with N_mc = {calc_result['inputs']['N_mc']} rpm."
+        + (f" Relevant section: {section}." if section else "")
+        + (f" Page: {page}." if page else "")
+    )
+
+    return answer_obj
+
+
+# ===============================
 # ASK
 # ===============================
 
@@ -838,6 +997,7 @@ def ask(question: Question):
             "variables": [],
             "reference": {"section": "", "table": "", "annex": "", "figure": "", "page": ""},
             "mode": mode,
+            "calculated": False,
             "sources": [],
             "retrieved_chunks_preview": [],
             "queries_used": query_set
@@ -870,6 +1030,8 @@ def ask(question: Question):
                 answer_obj = second_answer_obj
                 query_set = list(dict.fromkeys(query_set + extra_queries))
 
+    answer_obj = apply_calculation_layer(answer_obj, question.query)
+
     formula_latex = clean_latex_escapes(answer_obj.get("formula_latex", ""))
     formula_pretty = latex_to_pretty_text(formula_latex) if formula_latex else ""
 
@@ -888,6 +1050,9 @@ def ask(question: Question):
             {"section": "", "table": "", "annex": "", "figure": "", "page": ""}
         ),
         "mode": answer_obj.get("mode", mode),
+        "calculated": answer_obj.get("calculated", False),
+        "calculation": answer_obj.get("calculation", {}),
+        "original_answer_before_calculation": answer_obj.get("original_answer_before_calculation", ""),
         "sources": [
             {
                 "page": hit["page"],
